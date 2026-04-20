@@ -22,6 +22,8 @@ use {defmt_rtt as _, panic_probe as _};
 use embassy_stm32::Peri;
 use crate::sai::FrameSyncOffset;
 use crate::sai::FrameSyncPolarity;
+use embassy_futures::select::{select, Either};
+use defmt::warn;
 
 bind_interrupts!(struct Irqs {
     USB_DRD_FS => usb::InterruptHandler<peripherals::USB>;
@@ -189,13 +191,29 @@ async fn audio_receiver_task(
     let mut sai = new_sai(&mut write_buffer, &mut resources);
 
     loop {
-        let samples = usb_audio_receiver.receive().await;
+        // Ждем либо новые данные из USB, либо аппаратную ошибку/прерывание от SAI
+        match select(usb_audio_receiver.receive(), sai.wait_write_error()).await {
+            // Вариант 1: Пришли данные
+            Either::First(samples) => {
+                if let Err(error) = sai.write(samples.as_slice()).await {
+                    error!("SAI write error: {}. Resetting SAI...", error);
+                    // Если произошла ошибка при записи, пересоздаем SAI
+                    drop(sai);
+                    sai = new_sai(&mut write_buffer, &mut resources);
+                }
+                // Подтверждаем получение для zerocopy_channel
+                usb_audio_receiver.receive_done();
+            }
 
-        if let Err(error) = sai.write(samples.as_slice()).await {
-            error!("SAI write error: {}", error);
+            // Вариант 2: SAI сообщил об ошибке (например, опустел буфер из-за паузы)
+            Either::Second(_) => {
+                warn!("SAI Sync lost or underrun. Resetting...");
+                // Сбрасываем SAI, чтобы выровнять каналы (L/R) при возобновлении
+                drop(sai);
+                sai = new_sai(&mut write_buffer, &mut resources);
+                // Здесь receive_done не нужен, так как данные из канала не вынимались
+            }
         }
-
-        usb_audio_receiver.receive_done();
     }
 }
 
