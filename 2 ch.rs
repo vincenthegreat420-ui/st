@@ -3,27 +3,24 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_stm32::time::Hertz;
-use embassy_stm32::{Config, bind_interrupts, dma, peripherals, sai};
+use embassy_stm32::{bind_interrupts, dma, peripherals, sai, Config};
 use embassy_stm32::sai::{
     BitOrder, ClockStrobe, DataSize, FrameSyncOffset, FrameSyncPolarity,
     MasterClockDivider, Sai, SyncInput, word,
 };
 use {defmt_rtt as _, panic_probe as _};
 
-bind_interrupts!(struct IrqsA {
+bind_interrupts!(struct Irqs {
     GPDMA1_CHANNEL1 => dma::InterruptHandler<peripherals::GPDMA1_CH1>;
-});
-
-bind_interrupts!(struct IrqsB {
     GPDMA1_CHANNEL2 => dma::InterruptHandler<peripherals::GPDMA1_CH2>;
 });
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    info!("Dual SAI codec-style start");
+    info!("SAI dual (join) start");
 
-    // ---------------- CLOCK ----------------
     let mut config = Config::default();
     {
         use embassy_stm32::rcc::*;
@@ -37,7 +34,7 @@ async fn main(_spawner: Spawner) {
             source: PllSource::HSE,
             prediv: PllPreDiv::DIV5,
             mul: PllMul::MUL192,
-            divp: Some(PllDiv::DIV25),
+            divp: Some(PllDiv::DIV25), // 12.288 MHz
                                divq: None,
                                divr: None,
         });
@@ -47,88 +44,70 @@ async fn main(_spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
-    // ---------------- BUFFERS ----------------
     let mut buf_a = [0u32; 256];
     let mut buf_b = [0u32; 256];
 
-    // ---------------- SPLIT SAI ----------------
     let (sai_a, sai_b) = sai::split_subblocks(p.SAI1);
 
-    // ---------------- COMMON CONFIG ----------------
     let mut cfg = sai::Config::default();
-
     cfg.bit_order = BitOrder::MsbFirst;
+    cfg.slot_count = word::U4(2);
     cfg.data_size = DataSize::Data32;
-
-    // 🔥 MONO MODE (IMPORTANT)
-    cfg.slot_count = word::U4(1);
-    cfg.frame_length = 32;
-
-    cfg.frame_sync_offset = FrameSyncOffset::BeforeFirstBit;
-    cfg.frame_sync_polarity = FrameSyncPolarity::ActiveLow;
-
-    cfg.clock_strobe = ClockStrobe::Rising;
+    cfg.frame_length = 64;
+    cfg.frame_sync_active_level_length = word::U7(32);
     cfg.master_clock_divider = MasterClockDivider::DIV1;
+    cfg.clock_strobe = ClockStrobe::Rising;
+    cfg.frame_sync_offset = FrameSyncOffset::BeforeFirstBit;
+    cfg.frame_sync_polarity = FrameSyncPolarity::ActiveHigh;
 
-    // ---------------- MASTER (LEFT DAC) ----------------
+    // MASTER
     let mut sai_a = Sai::new_asynchronous_with_mclk(
         sai_a,
-        p.PE5, // SCK
-        p.PE6, // SD_A → DAC1
-        p.PE4, // FS
-        p.PE2, // MCLK
+        p.PE5,
+        p.PE6,
+        p.PE4,
+        p.PE2,
         p.GPDMA1_CH1,
         &mut buf_a,
-        IrqsA,
+        Irqs,
         cfg,
     );
 
-    // ---------------- SLAVE (RIGHT DAC) ----------------
-    let mut cfg_b = cfg.clone();
+    // SLAVE
+    let mut cfg_b = cfg;
     cfg_b.sync_input = SyncInput::Internal;
 
     let mut sai_b = Sai::new_synchronous(
         sai_b,
-        p.PE3, // SD_B → DAC2
+        p.PE3,
         p.GPDMA1_CH2,
         &mut buf_b,
-        IrqsB,
+        Irqs,
         cfg_b,
     );
 
-    // ---------------- TEST SIGNAL ----------------
-    let sample_rate = 48_000;
-    let freq = 1000;
-    let period = sample_rate / freq;
+    // --- тест сигнал ---
+    let mut data_a = [0u32; 128];
+    let mut data_b = [0u32; 128];
 
-    let mut left = [0u32; 128];
-    let mut right = [0u32; 128];
+    for i in (0..128).step_by(2) {
+        data_a[i] = 0x7FFFFFFF;
+        data_a[i + 1] = 0;
 
-    for i in 0..128 {
-        let v = if (i % period) < (period / 2) {
-            0x7FFFFFFF
-        } else {
-            0x80000000
-        };
-
-        left[i] = v;
-        right[i] = v;
+        data_b[i] = 0x80000000;
+        data_b[i + 1] = 0;
     }
 
-    info!("Priming slave (B)");
-
-    // 🔥 CRITICAL: prime B first
-    let _ = sai_b.write(&right).await;
-
-    info!("Starting master (A)");
-
-    let _ = sai_a.write(&left).await;
-
-    info!("Running sync audio");
+    // первый запуск
+    join(
+        sai_a.write(&data_a),
+         sai_b.write(&data_b),
+    ).await;
 
     loop {
-        // continuous aligned streaming
-        let _ = sai_a.write(&left).await;
-        let _ = sai_b.write(&right).await;
+        join(
+            sai_a.write(&data_a),
+             sai_b.write(&data_b),
+        ).await;
     }
 }
