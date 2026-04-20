@@ -22,12 +22,13 @@ use {defmt_rtt as _, panic_probe as _};
 use embassy_stm32::Peri;
 use crate::sai::FrameSyncOffset;
 use crate::sai::FrameSyncPolarity;
-use embassy_futures::select::{select, Either};
-use defmt::warn;
+use crate::sai::SyncInput;
+
 
 bind_interrupts!(struct Irqs {
     USB_DRD_FS => usb::InterruptHandler<peripherals::USB>;
     GPDMA1_CHANNEL1 => embassy_stm32::dma::InterruptHandler<peripherals::GPDMA1_CH1>;
+    GPDMA1_CHANNEL2 => embassy_stm32::dma::InterruptHandler<peripherals::GPDMA1_CH2>;
 });
 
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM5>>>> =
@@ -73,15 +74,29 @@ const TICKS_PER_SAMPLE: f32 = (FEEDBACK_COUNTER_TICK_RATE as f32) / (SAMPLE_RATE
 #[allow(missing_docs)]
 pub struct SaiResources {
     pub sai: Peri<'static, peripherals::SAI1>,
+
+    // --- A ---
     pub sck_a: Peri<'static, peripherals::PE5>,
     pub sd_a: Peri<'static, peripherals::PE6>,
     pub fs_a: Peri<'static, peripherals::PE4>,
     pub mclk_a: Peri<'static, peripherals::PE2>,
     pub dma_a: Peri<'static, peripherals::GPDMA1_CH1>,
+
+    // --- B ---
+    pub sd_b: Peri<'static, peripherals::PE3>,
+    pub dma_b: Peri<'static, peripherals::GPDMA1_CH2>,
 }
 
-fn new_sai<'d>(write_buffer: &'d mut [u32], resources: &'d mut SaiResources) -> Sai<'d, peripherals::SAI1, u32> {
-    let (sai_a, _) = sai::split_subblocks(resources.sai.reborrow());
+fn new_sai_dual<'d>(
+    write_buffer_a: &'d mut [u32],
+    write_buffer_b: &'d mut [u32],
+    resources: &'d mut SaiResources,
+) -> (
+    Sai<'d, peripherals::SAI1, u32>,
+    Sai<'d, peripherals::SAI1, u32>,
+)
+{
+    let (sai_a, sai_b) = sai::split_subblocks(resources.sai.reborrow());
 
     let mut config = sai::Config::default();
     config.bit_order = BitOrder::MsbFirst;
@@ -93,17 +108,35 @@ fn new_sai<'d>(write_buffer: &'d mut [u32], resources: &'d mut SaiResources) -> 
     config.clock_strobe = ClockStrobe::Falling;
     config.frame_sync_offset = FrameSyncOffset::BeforeFirstBit;
     config.frame_sync_polarity = FrameSyncPolarity::ActiveLow;
-    sai::Sai::new_asynchronous_with_mclk(
+
+    // --- MASTER ---
+    let sai_a = sai::Sai::new_asynchronous_with_mclk(
         sai_a,
         resources.sck_a.reborrow(),
-                                         resources.sd_a.reborrow(),
-                                         resources.fs_a.reborrow(),
-                                         resources.mclk_a.reborrow(),   // Важно: MCLK подключён
-                                         resources.dma_a.reborrow(),
-                                         write_buffer,
-                                         Irqs,
-                                         config,
-    )
+                                                     resources.sd_a.reborrow(),
+                                                     resources.fs_a.reborrow(),
+                                                     resources.mclk_a.reborrow(),
+                                                     resources.dma_a.reborrow(),
+                                                     write_buffer_a,
+                                                     Irqs,
+                                                     config,
+    );
+
+    // --- SLAVE ---
+    let mut config_b = config;
+    config_b.sync_input = SyncInput::Internal;
+
+    let sai_b = sai::Sai::new_synchronous(
+        sai_b,
+        resources.sd_b.reborrow(),
+                                          resources.dma_b.reborrow(),
+                                          write_buffer_b,
+                                          Irqs,
+                                          config_b,
+    );
+
+    (sai_a, sai_b)
+
 }
 
 struct Disconnected {}
@@ -185,35 +218,24 @@ async fn audio_receiver_task(
     mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
     mut resources: SaiResources,
 ) {
-    let mut write_buffer = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
-    info!("Write buffer: {} samples", write_buffer.len());
+    let mut write_buffer_a = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
+    let mut write_buffer_b = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
 
-    let mut sai = new_sai(&mut write_buffer, &mut resources);
+    info!("Write buffer A: {}", write_buffer_a.len());
+    info!("Write buffer B: {}", write_buffer_b.len());
+
+    let (mut sai_a, mut sai_b) =
+    new_sai_dual(&mut write_buffer_a, &mut write_buffer_b, &mut resources);
 
     loop {
-        // Ждем либо новые данные из USB, либо аппаратную ошибку/прерывание от SAI
-        match select(usb_audio_receiver.receive(), sai.wait_write_error()).await {
-            // Вариант 1: Пришли данные
-            Either::First(samples) => {
-                if let Err(error) = sai.write(samples.as_slice()).await {
-                    error!("SAI write error: {}. Resetting SAI...", error);
-                    // Если произошла ошибка при записи, пересоздаем SAI
-                    drop(sai);
-                    sai = new_sai(&mut write_buffer, &mut resources);
-                }
-                // Подтверждаем получение для zerocopy_channel
-                usb_audio_receiver.receive_done();
-            }
+        let samples = usb_audio_receiver.receive().await;
 
-            // Вариант 2: SAI сообщил об ошибке (например, опустел буфер из-за паузы)
-            Either::Second(_) => {
-                warn!("SAI Sync lost or underrun. Resetting...");
-                // Сбрасываем SAI, чтобы выровнять каналы (L/R) при возобновлении
-                drop(sai);
-                sai = new_sai(&mut write_buffer, &mut resources);
-                // Здесь receive_done не нужен, так как данные из канала не вынимались
-            }
-        }
+        let _ = embassy_futures::join::join(
+            sai_a.write(samples.as_slice()),
+                                            sai_b.write(samples.as_slice()),
+        ).await;
+
+        usb_audio_receiver.receive_done();
     }
 }
 
@@ -414,11 +436,15 @@ async fn main(spawner: Spawner) {
     // Initialize SAI resources
     let sai_resources = SaiResources {
         sai: p.SAI1,
+
         sck_a: p.PE5,
         sd_a: p.PE6,
         fs_a: p.PE4,
         mclk_a: p.PE2,
         dma_a: p.GPDMA1_CH1,
+
+        sd_b: p.PE3,
+        dma_b: p.GPDMA1_CH2,
     };
 
     // Run a timer for counting between SOF interrupts.
