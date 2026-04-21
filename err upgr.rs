@@ -189,48 +189,52 @@ async fn audio_receiver_task(
     let mut sai = new_sai(&mut write_buffer, &mut resources);
 
     loop {
-        match select(
+        let result = select(
             usb_audio_receiver.receive(),
-                     sai.wait_write_error(),
-        ).await {
-            // 📦 Данные от USB
-            Either::First(samples) => {
-                let slice = samples.as_slice();
+                            sai.wait_write_error(),
+        ).await;
 
-                // базовая защита от кривого пакета
-                if slice.len() % INPUT_CHANNEL_COUNT != 0 {
-                    warn!("Bad alignment → reset");
+        // ❗ Сначала обрабатываем ошибку
+        if let Either::Second(_) = result {
+            warn!("Underrun → reset");
 
-                    usb_audio_receiver.receive_done();
+            drop(sai);
+            sai = new_sai(&mut write_buffer, &mut resources);
+            continue;
+        }
 
-                    drop(sai);
-                    sai = new_sai(&mut write_buffer, &mut resources);
-                    continue;
-                }
+        // ✅ Теперь точно safe
+        let samples = match result {
+            Either::First(samples) => samples,
+            _ => unreachable!(),
+        };
 
-                if let Err(e) = sai.write(slice).await {
-                    error!("SAI error: {}", e);
+        let slice = samples.as_slice();
 
-                    usb_audio_receiver.receive_done();
+        if slice.len() % INPUT_CHANNEL_COUNT != 0 {
+            warn!("Bad alignment → reset");
 
-                    drop(sai);
-                    sai = new_sai(&mut write_buffer, &mut resources);
-                } else {
-                    usb_audio_receiver.receive_done();
-                }
-            }
+            usb_audio_receiver.receive_done();
 
-            // ⚠️ Underrun / sync loss
-            Either::Second(_) => {
-                warn!("Underrun → reset");
+            drop(sai);
+            sai = new_sai(&mut write_buffer, &mut resources);
+            continue;
+        }
 
-                drop(sai);
-                sai = new_sai(&mut write_buffer, &mut resources);
-            }
+
+
+        if let Err(e) = sai.write(slice).await {
+            error!("SAI error: {}", e);
+
+            usb_audio_receiver.receive_done();
+
+            drop(sai);
+            sai = new_sai(&mut write_buffer, &mut resources);
+        } else {
+            usb_audio_receiver.receive_done();
         }
     }
 }
-
 /// Receives audio samples from the host.
 #[embassy_executor::task]
 async fn usb_streaming_task(
