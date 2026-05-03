@@ -42,7 +42,7 @@ pub const INPUT_CHANNEL_COUNT: usize = 2;
 
 // This example uses a fixed sample rate of 48 kHz.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
-pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 24_576_000;
+pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 12_288_000;
 
 // Use 32 bit samples, which allow for a lot of (software) volume adjustment without degradation of quality.
 pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
