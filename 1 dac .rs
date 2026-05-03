@@ -438,7 +438,7 @@ async fn main(spawner: Spawner) {
     // Run a timer for counting between SOF interrupts.
     let mut tim5 = timer::low_level::Timer::new(p.TIM5);
     tim5.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
-    tim5.set_trigger_source(timer::low_level::TriggerSource::ITR1);
+    tim5.set_trigger_source(timer::low_level::TriggerSource::ITR12);
 
     const TIMER_CHANNEL: timer::Channel = timer::Channel::Ch1;
     tim5.set_input_ti_selection(TIMER_CHANNEL, timer::low_level::InputTISelection::TRC);
