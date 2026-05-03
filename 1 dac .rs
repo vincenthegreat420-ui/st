@@ -179,39 +179,53 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
     }
 }
 
-/// Receives audio samples from the USB streaming task and can play them back.
 #[embassy_executor::task]
 async fn audio_receiver_task(
     mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
     mut resources: SaiResources,
 ) {
+    // Буфер для DMA SAI
     let mut write_buffer = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
-    info!("Write buffer: {} samples", write_buffer.len());
+    info!("Audio task started. Write buffer: {} samples", write_buffer.len());
 
     let mut sai = new_sai(&mut write_buffer, &mut resources);
 
     loop {
-        // Ждем либо новые данные из USB, либо аппаратную ошибку/прерывание от SAI
+        // Ждем либо данные из USB, либо сигнал об аппаратной ошибке SAI
         match select(usb_audio_receiver.receive(), sai.wait_write_error()).await {
-            // Вариант 1: Пришли данные
+            // КЕЙС 1: Получены новые данные из USB
             Either::First(samples) => {
-                if let Err(error) = sai.write(samples.as_slice()).await {
-                    error!("SAI write error: {}. Resetting SAI...", error);
-                    // Если произошла ошибка при записи, пересоздаем SAI
-                    drop(sai);
-                    sai = new_sai(&mut write_buffer, &mut resources);
+                let data = samples.as_slice();
+
+                // 1. Проверка на четность (защита от смены каналов L/R)
+                if !data.is_empty() && (data.len() % 2 == 0) {
+                    // 2. Попытка записи в SAI
+                    if let Err(error) = sai.write(data).await {
+                        error!("SAI write error: {}. Resetting SAI...", error);
+
+                        // Сброс периферии для восстановления синхронизации
+                        drop(sai);
+                        sai = new_sai(&mut write_buffer, &mut resources);
+                    }
+                } else if !data.is_empty() {
+                    warn!("Dropped packet with odd sample count: {} (Alignment safety)", data.len());
                 }
-                // Подтверждаем получение для zerocopy_channel
+
+                // Обязательно подтверждаем обработку, чтобы канал не заблокировался
                 usb_audio_receiver.receive_done();
             }
 
-            // Вариант 2: SAI сообщил об ошибке (например, опустел буфер из-за паузы)
-            Either::Second(_) => {
-                warn!("SAI Sync lost or underrun. Resetting...");
-                // Сбрасываем SAI, чтобы выровнять каналы (L/R) при возобновлении
+            // КЕЙС 2: Аппаратная ошибка SAI (например, FIFO underrun/overrun)
+            Either::Second(err) => {
+                error!("SAI hardware error detected: {}. Performing reset...", err);
+
+                // Полная переинициализация
                 drop(sai);
                 sai = new_sai(&mut write_buffer, &mut resources);
-                // Здесь receive_done не нужен, так как данные из канала не вынимались
+
+                // Опционально: если ошибка критическая, можно очистить текущий пакет в USB канале,
+                // чтобы не пытаться воспроизвести "битый" кусок данных после сброса.
+                // Это предотвращает циклическую ошибку.
             }
         }
     }
